@@ -18,6 +18,12 @@
 //! This module provides a means for executing contracts
 //! represented in wasm.
 
+#[macro_use]
+mod env_def;
+mod code_cache;
+mod prepare;
+mod runtime;
+
 use crate::{
 	CodeHash, Schedule, Config,
 	wasm::env_def::FunctionImplProvider,
@@ -27,44 +33,76 @@ use crate::{
 use sp_std::prelude::*;
 use sp_core::crypto::UncheckedFrom;
 use codec::{Encode, Decode};
-
-#[macro_use]
-mod env_def;
-mod code_cache;
-mod prepare;
-mod runtime;
-
+use frame_support::dispatch::DispatchError;
 use self::code_cache::load as load_code;
 use pallet_contracts_primitives::ExecResult;
 
-pub use self::code_cache::save as save_code;
+pub use self::{
+	prepare::prepare_contract,
+	runtime::{ReturnCode, Runtime, RuntimeToken},
+	code_cache::{
+		increment_refcount as add_code_user,
+		decrement_refcount as remove_code_user,
+	},
+};
 #[cfg(feature = "runtime-benchmarks")]
-pub use self::code_cache::save_raw as save_code_raw;
-pub use self::runtime::{ReturnCode, Runtime, RuntimeToken};
+pub use self::code_cache::prepare_and_store_unchecked as prepare_and_store_unchecked_code;
 
 /// A prepared wasm module ready for execution.
 #[derive(Clone, Encode, Decode)]
-pub struct PrefabWasmModule {
+pub struct PrefabWasmModule<T: Config> {
 	/// Version of the schedule with which the code was instrumented.
 	#[codec(compact)]
 	schedule_version: u32,
+	/// Initial memory size of a contract's sandbox.
 	#[codec(compact)]
 	initial: u32,
+	/// The maximum memory size of a contract's sandbox.
 	#[codec(compact)]
 	maximum: u32,
+	/// The number of alive contracts that use this as their contract code.
+	///
+	/// If this number drops to zero this module is removed from storage.
+	#[codec(compact)]
+	refcount: u64,
 	/// This field is reserved for future evolution of format.
 	///
-	/// Basically, for now this field will be serialized as `None`. In the future
-	/// we would be able to extend this structure with.
+	/// For now this field is serialized as `None`. In the future we are able to change the
+	/// type parameter to a new struct that contains the fields that we want to add.
+	/// That new struct would also contain a reserved field for its future extensions.
+	/// This works because in SCALE `None` is encoded independently from the type parameter
+	/// of the option.
 	_reserved: Option<()>,
 	/// Code instrumented with the latest schedule.
 	code: Vec<u8>,
+	/// The uninstrumented, prestine version of the code.
+	///
+	/// It is not stored because the pristine code has its own storage item. The value
+	/// is only `Some` when this module was created from an `original_code` and `None` if
+	/// it was loaded from storage.
+	#[codec(skip)]
+	original_code: Option<Vec<u8>>,
+	/// The code hash of the stored code which is defined as the hash over the `original_code`.
+	///
+	/// As the map key there is no need to store the hash in the value, too. It is set manually
+	/// when loading the module from storage.
+	#[codec(skip)]
+	code_hash: CodeHash<T>,
+}
+
+impl<T: Config> PrefabWasmModule<T> {
+	/// Return the refcount of the module.
+	#[cfg(test)]
+	pub fn refcount(&self) -> u64 {
+		self.refcount
+	}
 }
 
 /// Wasm executable loaded by `WasmLoader` and executed by `WasmVm`.
-pub struct WasmExecutable {
+pub struct WasmExecutable<'a, T: Config> {
 	entrypoint_name: &'static str,
-	prefab_module: PrefabWasmModule,
+	prefab_module: PrefabWasmModule<T>,
+	schedule: &'a Schedule<T>,
 }
 
 /// Loader which fetches `WasmExecutable` from the code cache.
@@ -82,50 +120,47 @@ impl<'a, T: Config> crate::exec::Loader<T> for WasmLoader<'a, T>
 where
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>
 {
-	type Executable = WasmExecutable;
+	type Executable = WasmExecutable<'a, T>;
 
-	fn load_init(&self, code_hash: &CodeHash<T>) -> Result<WasmExecutable, &'static str> {
+	fn load_init(&self, code_hash: CodeHash<T>) -> Result<WasmExecutable<'a, T>, DispatchError> {
 		let prefab_module = load_code::<T>(code_hash, self.schedule)?;
 		Ok(WasmExecutable {
 			entrypoint_name: "deploy",
 			prefab_module,
+			schedule: self.schedule,
 		})
 	}
-	fn load_main(&self, code_hash: &CodeHash<T>) -> Result<WasmExecutable, &'static str> {
+	fn load_main(&self, code_hash: CodeHash<T>) -> Result<WasmExecutable<'a, T>, DispatchError> {
 		let prefab_module = load_code::<T>(code_hash, self.schedule)?;
 		Ok(WasmExecutable {
 			entrypoint_name: "call",
 			prefab_module,
+			schedule: self.schedule,
 		})
 	}
-}
-
-/// Implementation of `Vm` that takes `WasmExecutable` and executes it.
-pub struct WasmVm<'a, T: Config> where T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]> {
-	schedule: &'a Schedule<T>,
-}
-
-impl<'a, T: Config> WasmVm<'a, T> where T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]> {
-	pub fn new(schedule: &'a Schedule<T>) -> Self {
-		WasmVm { schedule }
+	fn get_init(&self, module: PrefabWasmModule<T>) -> Self::Executable {
+		WasmExecutable {
+			entrypoint_name: "deploy",
+			prefab_module: module,
+			schedule: self.schedule,
+		}
 	}
 }
 
-impl<'a, T: Config> crate::exec::Vm<T> for WasmVm<'a, T>
+impl<'a, T: Config> crate::exec::Executable<T> for WasmExecutable<'a, T>
 where
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>
 {
-	type Executable = WasmExecutable;
+	type Module = PrefabWasmModule<T>;
 
 	fn execute<E: Ext<T = T>>(
 		&self,
-		exec: &WasmExecutable,
 		mut ext: E,
 		input_data: Vec<u8>,
 		gas_meter: &mut GasMeter<E::T>,
 	) -> ExecResult {
 		let memory =
-			sp_sandbox::Memory::new(exec.prefab_module.initial, Some(exec.prefab_module.maximum))
+			sp_sandbox::Memory::new(self.prefab_module.initial, Some(self.prefab_module.maximum))
 				.unwrap_or_else(|_| {
 				// unlike `.expect`, explicit panic preserves the source location.
 				// Needed as we can't use `RUST_BACKTRACE` in here.
@@ -152,9 +187,17 @@ where
 
 		// Instantiate the instance from the instrumented module code and invoke the contract
 		// entrypoint.
-		let result = sp_sandbox::Instance::new(&exec.prefab_module.code, &imports, &mut runtime)
-			.and_then(|mut instance| instance.invoke(exec.entrypoint_name, &[], &mut runtime));
+		let result = sp_sandbox::Instance::new(&self.prefab_module.code, &imports, &mut runtime)
+			.and_then(|mut instance| instance.invoke(self.entrypoint_name, &[], &mut runtime));
 		runtime.to_execution_result(result)
+	}
+
+	fn code_hash(&self) -> &CodeHash<T> {
+		&self.prefab_module.code_hash
+	}
+
+	fn store(self) {
+		code_cache::store(self.prefab_module)
 	}
 }
 
@@ -163,7 +206,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		CodeHash, BalanceOf, Error, Module as Contracts,
-		exec::{Ext, StorageKey, AccountIdOf},
+		exec::{Ext, StorageKey, AccountIdOf, Executable},
 		gas::{Gas, GasMeter},
 		tests::{Test, Call, ALICE, BOB},
 		wasm::prepare::prepare_contract,
@@ -234,7 +277,7 @@ mod tests {
 		}
 		fn instantiate(
 			&mut self,
-			code_hash: &CodeHash<Test>,
+			code_hash: CodeHash<Test>,
 			endowment: u64,
 			gas_meter: &mut GasMeter<Test>,
 			data: Vec<u8>,
@@ -248,7 +291,7 @@ mod tests {
 				salt: salt.to_vec(),
 			});
 			Ok((
-				Contracts::<Test>::contract_address(&ALICE, code_hash, salt),
+				Contracts::<Test>::contract_address(&ALICE, &code_hash, salt),
 				ExecReturnValue {
 					flags: ReturnFlags::empty(),
 					data: Vec::new(),
@@ -368,7 +411,7 @@ mod tests {
 		}
 		fn instantiate(
 			&mut self,
-			code: &CodeHash<Test>,
+			code: CodeHash<Test>,
 			value: u64,
 			gas_meter: &mut GasMeter<Test>,
 			input_data: Vec<u8>,
@@ -466,23 +509,18 @@ mod tests {
 		<E::T as frame_system::Config>::AccountId:
 			UncheckedFrom<<E::T as frame_system::Config>::Hash> + AsRef<[u8]>
 	{
-		use crate::exec::Vm;
-
 		let wasm = wat::parse_str(wat).unwrap();
 		let schedule = crate::Schedule::default();
-		let prefab_module =
-			prepare_contract::<super::runtime::Env, E::T>(&wasm, &schedule).unwrap();
+		let prefab_module = prepare_contract::<E::T>(wasm, &schedule).unwrap();
 
 		let exec = WasmExecutable {
 			// Use a "call" convention.
 			entrypoint_name: "call",
 			prefab_module,
+			schedule: &schedule,
 		};
 
-		let cfg = Default::default();
-		let vm = WasmVm::new(&cfg);
-
-		vm.execute(&exec, ext, input_data, gas_meter)
+		exec.execute(ext, input_data, gas_meter)
 	}
 
 	const CODE_TRANSFER: &str = r#"
